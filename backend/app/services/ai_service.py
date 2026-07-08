@@ -1,21 +1,47 @@
+"""
+services/ai_service.py - AI Screening, Parsing support, & Interview Copilot Service
+====================================================================================
+This service acts as the intelligence layer of the application. It handles:
+1. Contacting the Groq API (running the 'llama-3.1-8b-instant' model) to perform AI tasks.
+2. Generating two-sentence candidate profile summaries based on their resume text.
+3. Scoring candidates against job descriptions and required skills (out of 100).
+4. Generating custom interview questions based on candidate expertise and difficulty.
+5. Powering the "HR Copilot" query system to search, rank, and compare candidates.
+
+Heuristic Fallbacks:
+- If no GROQ_API_KEY is configured in the `.env` file, the service runs local fallback
+  algorithms (using regular expressions and text keyword analysis) so that the entire
+  TalentFlow application continues to function perfectly out-of-the-box in offline mode.
+"""
+
 import requests
 import json
 import re
 from typing import Dict, List, Any, Optional
 from app import config
 
+# Groq Cloud API URL and Model Selection
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL_NAME = "llama-3.1-8b-instant"
 
 def clean_text(text: str) -> str:
+    """Removes special characters and symbols from raw text, leaving only alphanumeric characters."""
     return re.sub(r'[^a-zA-Z0-9\s]', '', text)
 
 def parse_json_from_text(text: str) -> Optional[Any]:
+    """
+    Utility to safely extract and parse JSON formatting from LLM model responses.
+    
+    Sometimes AI models return markdown blocks (like ```json ... ```) or surround
+    their response with narrative text. This function extracts the JSON substring
+    and converts it to a Python list or dictionary.
+    """
     list_start = text.find('[')
     list_end = text.rfind(']')
     dict_start = text.find('{')
     dict_end = text.rfind('}')
     
+    # 1. Try to find complete dictionary {...} or list [...] and parse it
     if dict_start != -1 and (list_start == -1 or dict_start < list_start):
         try:
             return json.loads(text[dict_start:dict_end+1])
@@ -31,6 +57,7 @@ def parse_json_from_text(text: str) -> Optional[Any]:
             return json.loads(text[dict_start:dict_end+1])
         except Exception:
             pass
+    # 2. Cleanup markdown code fence wrappers (```json ... ```) if found
     try:
         clean = re.sub(r'```json\s*|\s*```', '', text).strip()
         return json.loads(clean)
@@ -38,6 +65,13 @@ def parse_json_from_text(text: str) -> Optional[Any]:
         return None
 
 def _call_groq(prompt: str, system_prompt: str = "You are a helpful HR AI assistant.") -> Optional[str]:
+    """
+    Low-level helper that sends requests to the Groq Cloud API.
+    
+    Returns the string text answer if the API responds with 200 OK.
+    Returns None if the key is missing, network is offline, or API errors out.
+    """
+    # If the recruiter hasn't provided a Groq Key in their .env, fall back directly
     if not config.GROQ_API_KEY:
         print("Groq API key not set. Using local fallback.")
         return None
@@ -52,11 +86,12 @@ def _call_groq(prompt: str, system_prompt: str = "You are a helpful HR AI assist
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,
+        "temperature": 0.2,     # Low temperature keeps answers structured and fact-based
         "max_tokens": 1024
     }
     
     try:
+        # Send HTTP POST request to Groq HTTP Endpoint (with a 12-second timeout safety)
         response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=12.0)
         if response.status_code == 200:
             result = response.json()
@@ -68,6 +103,12 @@ def _call_groq(prompt: str, system_prompt: str = "You are a helpful HR AI assist
     return None
 
 def generate_resume_summary(parsed_info: Dict[str, Any]) -> str:
+    """
+    Generates a concise, professional 2-sentence summary of the candidate's background.
+    
+    Heuristic Fallback:
+    If Groq is offline, it concatenates their top 5 listed skills, their education, and experience.
+    """
     prompt = f"""
     Create a professional, concise 2-sentence summary for the candidate based on these details:
     Name: {parsed_info.get('name')}
@@ -81,18 +122,30 @@ def generate_resume_summary(parsed_info: Dict[str, Any]) -> str:
     if response:
         return response
         
-    # Heuristic Fallback
+    # Heuristic Fallback (Local execution)
     skills = parsed_info.get("skills", [])
     exp = parsed_info.get("experience", "Not specified")
     edu = parsed_info.get("education", "Not specified")
-    name = parsed_info.get("name", "The candidate")
     
     skills_str = ", ".join(skills[:5]) if skills else "various technologies"
     summary = f"Experienced professional with background in {skills_str}. Has experience described as '{exp}' and education from '{edu[:60]}'."
     return summary
 
 def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, required_skills: List[str]) -> Dict[str, Any]:
-    # Clean required skills to lowercase
+    """
+    Compares a candidate's resume content against a job posting and calculates a match percentage.
+    
+    Returns a dictionary containing:
+      - match_score: (0-100) How well they fit the position.
+      - match_explanation: Plain-English summary explaining the score.
+      - strengths: List of up to 4 key highlights.
+      - missing_skills: Required skills they don't appear to have.
+      - career_path: List of suggested job titles they could grow into.
+      
+    Heuristic Fallback:
+    Uses sub-string search matching candidate's skills against job required skills.
+    Gives up to 70% of the score from matching skills, and up to 30% from years of experience keywords.
+    """
     req_skills_lower = [s.lower() for s in required_skills]
     cand_skills_lower = [s.lower() for s in parsed_info.get("skills", [])]
     
@@ -121,7 +174,7 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
     if response:
         data = parse_json_from_text(response)
         if data and isinstance(data, dict):
-            # Validate essential fields
+            # Validate required fields are present
             if "match_score" in data and "match_explanation" in data:
                 return {
                     "match_score": int(data["match_score"]),
@@ -131,15 +184,16 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
                     "career_path": data.get("career_path", [])
                 }
             
-    # Algorithm Local Fallback: Heuristic Match Scoring
+    # Algorithm Local Fallback: Heuristic Match Scoring (Runs locally if Groq key is absent/offline)
     matching_skills = []
     missing_skills = []
     
+    # 1. Skill evaluation (Max 70 points)
     for req in required_skills:
         req_clean = req.lower()
         matched = False
-        # direct substring matching
         for skill in cand_skills_lower:
+            # Check if job requirement matches or is contained in candidate skill list
             if req_clean in skill or skill in req_clean:
                 matching_skills.append(req)
                 matched = True
@@ -147,17 +201,14 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
         if not matched:
             missing_skills.append(req)
             
-    # Count skills match
     total_req = len(required_skills)
     skill_score_ratio = len(matching_skills) / max(total_req, 1)
+    base_score = int(skill_score_ratio * 70) 
     
-    # Calculate score
-    base_score = int(skill_score_ratio * 70) # 70% from matching skills
-    
-    # Experience score add (up to 30%)
+    # 2. Experience evaluation (Max 30 points)
     experience_text = str(parsed_info.get("experience", "")).lower()
     exp_bonus = 0
-    # Search for numbers of years, e.g. "3 years", "5+", etc.
+    # Search for numbers of years, e.g. "5 years", "3+", etc.
     year_match = re.search(r'(\d+)\s*year', experience_text)
     if year_match:
         years = int(year_match.group(1))
@@ -170,7 +221,7 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
         else:
             exp_bonus = 5
     else:
-        # Default bonus if experience contains words like 'experienced', 'senior'
+        # Default bonus if experience contains seniority words
         if "senior" in experience_text or "lead" in experience_text:
             exp_bonus = 25
         elif "developer" in experience_text or "engineer" in experience_text:
@@ -179,21 +230,19 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
             exp_bonus = 10
             
     match_score = min(base_score + exp_bonus, 100)
-    
-    # Heuristics explanation
     explanation = f"Matched {len(matching_skills)} out of {total_req} required skills. Experience keywords alignment is estimated at {exp_bonus}%."
     
-    # Strengths
+    # 3. Compile strengths
     strengths = [s.title() for s in matching_skills[:4]]
     if not strengths:
         strengths = [s.title() for s in parsed_info.get("skills", [])[:3]]
         if not strengths:
             strengths = ["Strong educational background" if parsed_info.get("education") else "General Tech Skills"]
             
-    # missing skills
+    # Compile missing skills list
     missing = [s.title() for s in missing_skills[:4]]
     
-    # Career recommendations
+    # Estimate potential career recommendations
     c_path = []
     text_lower = (clean_text(str(parsed_info.get("raw_text", ""))).lower())
     if "react" in text_lower or "frontend" in text_lower or "html" in text_lower:
@@ -212,6 +261,13 @@ def score_and_match_candidate(parsed_info: Dict[str, Any], job_desc: str, requir
     }
 
 def generate_interview_questions(parsed_info: Dict[str, Any], difficulty: str) -> List[str]:
+    """
+    Generates 4 personalized interview questions tailored to the candidate's actual listed skills.
+    
+    Parameters:
+      - parsed_info: dictionary containing candidates skills/experience
+      - difficulty: "Easy", "Medium", or "Hard"
+    """
     prompt = f"""
     Generate 4 technical interview questions for a candidate with these details:
     Skills: {', '.join(parsed_info.get('skills', []))}
@@ -231,7 +287,7 @@ def generate_interview_questions(parsed_info: Dict[str, Any], difficulty: str) -
         if questions and isinstance(questions, list):
             return [str(q) for q in questions[:4]]
             
-    # Fallback questions based on skills & difficulty
+    # Heuristic Fallback (Local execution)
     skills = parsed_info.get("skills", [])
     diff_lower = difficulty.lower()
     
@@ -251,19 +307,28 @@ def generate_interview_questions(parsed_info: Dict[str, Any], difficulty: str) -
             f"Explain your strategy for securing APIs, preventing SQL injections, XSS, and handling secure file uploads.",
             f"How do you handle microservices database consistency using the Saga or Outbox pattern?"
         ]
-    else: # Medium
+    else: # Medium (Default fallback option)
         return [
             f"How do you handle asynchronous operations and error management in {skill_context} applications?",
             f"Describe a challenging technical problem you solved in your projects, and how you arrived at the solution.",
             f"What is your testing strategy (unit, integration, E2E) and which tools do you prefer for testing backend code?",
-            f"What are REST best practices and how do you design versioned and secure APIs?"
+            f"What are REST merit principles and how do you design versioned and secure APIs?"
         ]
 
 def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Powers the recruiter interactive HR Copilot. It takes a typed query
+    (e.g., "Show candidates with React", "Compare Rahul and Sanya"), candidates, and jobs list,
+    and returns a summary, suggested UI action, and filtered candidate details.
+    
+    Heuristic Fallback:
+    Processes typical patterns (skills search, sorting best match score, candidate comparisons)
+    locally using Python logic.
+    """
     import re
     query_lower = query.lower()
     
-    # 1. Groq LLM Copilot Call (If Key is present)
+    # 1. Groq LLM Copilot Call (If Key is present in settings)
     if config.GROQ_API_KEY:
         # Simplify candidate/job entries to pass to prompt within context limits
         compact_candidates = []
@@ -312,32 +377,25 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
     
     # "Show candidates with X" or "Which candidates are missing Y"
     skill_filter_pattern = re.search(r'(?:with|missing|have|know|knows)\s+([a-zA-Z\+\#\s\.\,\-\_]+)', query_lower)
-    
-    # Check if query is looking for missing skill: "missing X"
     is_missing_query = "missing" in query_lower or "don't have" in query_lower or "without" in query_lower
     
-    # Filter candidates by skill
+    # Filter candidates by skill locally
     if skill_filter_pattern:
         searched_skill = skill_filter_pattern.group(1).strip()
-        # handle multiple separated skills
         skills_searched = [s.strip().replace(",", "").replace(".", "") for s in re.split(r'\s+and\s+|\s+or\s+|\,\s*', searched_skill) if s.strip()]
         
         matched_candidates = []
         for cand in candidates:
             cand_skills = [s.lower() for s in cand.get("parsed_skills", [])]
-            
-            # Check if matching
             has_match = False
             for s in skills_searched:
                 s_lower = s.lower()
-                # Check match
                 any_skill_has = any(s_lower in c_s or c_s in s_lower for c_s in cand_skills)
                 if any_skill_has:
                     has_match = True
                     break
                     
             if is_missing_query:
-                # We want candidates that do NOT have the skill
                 if not has_match:
                     matched_candidates.append(cand)
             else:
@@ -356,7 +414,7 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
             "data": matched_candidates
         }
         
-    # "Who is the best candidate?"
+    # Search top candidates ("Who is the best candidate?")
     if "best" in query_lower or "top" in query_lower or "highest" in query_lower:
         sorted_cands = sorted(candidates, key=lambda x: x.get("match_score", 0), reverse=True)
         top_cands = sorted_cands[:3] # top 3
@@ -373,19 +431,17 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
             "data": top_cands
         }
         
-    # "Compare Deepak and Rahul"
+    # Compare candidates ("Compare Deepak and Rahul")
     compare_pattern = re.findall(r'\b([a-zA-Z]{3,})\b', query)
-    # Filter potential names
     names_to_compare = []
     for word in compare_pattern:
         if word.lower() not in ["compare", "who", "best", "candidate", "and", "show", "missing", "python", "docker", "fastapi"]:
-            # Check if this matches a candidate name
             for cand in candidates:
                 if word.lower() in cand.get("name", "").lower():
                     names_to_compare.append(cand)
                     break
                     
-    # Remove duplicates from names_to_compare
+    # Remove duplicate candidate references
     seen_ids = set()
     unique_comparisons = []
     for cand in names_to_compare:
@@ -405,7 +461,7 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
             "data": [c1, c2]
         }
         
-    # Generate interview questions for the top candidate
+    # Generate question prompt requests locally
     if "question" in query_lower or "interview questions" in query_lower:
         sorted_cands = sorted(candidates, key=lambda x: x.get("match_score", 0), reverse=True)
         if sorted_cands:
@@ -417,7 +473,6 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
                 "What is your approach to automated testing and continuous integration?"
             ]
             natural = f"Generated interview questions for top candidate {top_cand['name']} based on their profile."
-            # Pack questions into data
             return {
                 "natural_response": natural,
                 "suggested_action": "questions",
@@ -431,7 +486,7 @@ def run_copilot_query(query: str, candidates: List[Dict[str, Any]], jobs: List[D
                 "data": []
             }
 
-    # Default response
+    # Help tips fallback
     natural = "I can help search, rank, compare candidates, or list missing skills. Try queries like: 'Show candidates with Python' or 'Who is the best candidate?'"
     return {
         "natural_response": natural,
