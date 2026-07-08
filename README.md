@@ -125,4 +125,3 @@ To deploy the application to a live internet server, keep note that the backend 
 
 ---
 
-*Designed by the TalentFlow recruitment software team.*
